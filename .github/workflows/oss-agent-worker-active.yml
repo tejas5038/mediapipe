@@ -1,3 +1,4 @@
+# oss agent worker v5 - CLI fallback for arbitrary public repositories
 name: OSS Agent Worker Active
 
 on:
@@ -5,6 +6,8 @@ on:
   push:
     branches:
       - master
+    paths:
+      - '.github/workflows/oss-agent-worker-active.yml'
   schedule:
     - cron: '*/5 * * * *'
 
@@ -29,52 +32,208 @@ jobs:
           set -euo pipefail
           url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"
           token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url")
-          echo "token=$(printf '%s' "$token_json" | jq -r '.value')" >> "$GITHUB_OUTPUT"
-      - name: Fetch task
+          token=$(printf '%s' "$token_json" | jq -r '.value')
+          test -n "$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch next queued task
         id: task
         env:
           OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' -d '{"action":"next_task"}' https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker > /tmp/response.json
+          curl -fsSL \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d '{"action":"next_task"}' \
+            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' \
+            > /tmp/response.json
           id=$(jq -r '.task.id // empty' /tmp/response.json)
-          if [ -z "$id" ]; then echo 'has_task=false' >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ -z "$id" ]; then
+            echo 'has_task=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo 'has_task=true' >> "$GITHUB_OUTPUT"
           echo "task_id=$id" >> "$GITHUB_OUTPUT"
           jq -c '.task' /tmp/response.json > /tmp/task.json
-      - name: Checkout
-        if: steps.task.outputs.has_task == 'true'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Execute task
+
+      - name: Execute task with GitHub CLI fallback
         if: steps.task.outputs.has_task == 'true'
         id: exec
+        env:
+          OSS_AGENT_GITHUB_TOKEN: ${{ secrets.OSS_AGENT_GITHUB_TOKEN }}
+          DEFAULT_GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+
+          task_type=$(jq -r '.task_type // "repo_edit"' /tmp/task.json)
+          upstream_repo=$(jq -r '.upstream_repo' /tmp/task.json)
+          base_ref=$(jq -r '.base_ref' /tmp/task.json)
           branch=$(jq -r '.branch_name' /tmp/task.json)
-          base=$(jq -r '.base_ref' /tmp/task.json)
-          upstream=$(jq -r '.upstream_repo' /tmp/task.json)
-          git config user.name oss-agent-worker
-          git config user.email oss-agent-worker@users.noreply.github.com
+
+          if [ -z "$upstream_repo" ] || [ "$upstream_repo" = "null" ]; then
+            echo 'Task is missing upstream_repo' >&2
+            exit 10
+          fi
+
+          # Prefer the long-lived user token. GH_TOKEN makes gh fully non-interactive:
+          # no browser login, gh auth refresh, or persisted runner session is required.
+          if [ -n "${OSS_AGENT_GITHUB_TOKEN:-}" ]; then
+            export GH_TOKEN="$OSS_AGENT_GITHUB_TOKEN"
+          else
+            export GH_TOKEN="$DEFAULT_GITHUB_TOKEN"
+          fi
+
+          gh auth status >/dev/null
+          actor=$(gh api user --jq '.login')
+          echo "GitHub CLI actor: $actor"
+
+          if [ "$task_type" = 'github_create_pr' ]; then
+            title=$(jq -r '.title' /tmp/task.json)
+            body=$(jq -r '.body' /tmp/task.json)
+            head=$(jq -r '.head // empty' /tmp/task.json)
+            if [ -z "$head" ]; then
+              head="${actor}:${branch}"
+            fi
+
+            pr_url=$(gh pr create \
+              --repo "$upstream_repo" \
+              --base "$base_ref" \
+              --head "$head" \
+              --title "$title" \
+              --body "$body")
+            pr_number=$(gh pr view "$pr_url" --json number --jq '.number')
+            echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+            echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"
+            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          repo_name=${upstream_repo#*/}
+          fork_repo="${actor}/${repo_name}"
+          workdir="${RUNNER_TEMP}/oss-target"
+          rm -rf "$workdir"
+
+          if [ "$upstream_repo" = "$GITHUB_REPOSITORY" ]; then
+            gh repo clone "$upstream_repo" "$workdir" -- --filter=blob:none
+            fork_repo="$upstream_repo"
+          else
+            # This is the key fallback for repos that are discoverable publicly but are
+            # unavailable through the connector/plugin installation surface.
+            if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then
+              parent=$(gh api "repos/${fork_repo}" --jq '.parent.full_name // empty')
+              if [ "$parent" != "$upstream_repo" ]; then
+                echo "Cannot fork $upstream_repo: $fork_repo already exists and is not its fork" >&2
+                exit 11
+              fi
+            else
+              gh repo fork "$upstream_repo" --clone=false
+            fi
+
+            # Fork creation can be asynchronous. Wait briefly until the fork is readable.
+            ready=false
+            for _ in $(seq 1 12); do
+              if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then
+                ready=true
+                break
+              fi
+              sleep 5
+            done
+            if [ "$ready" != true ]; then
+              echo "Fork $fork_repo did not become ready" >&2
+              exit 12
+            fi
+
+            gh repo clone "$fork_repo" "$workdir" -- --filter=blob:none
+          fi
+
+          cd "$workdir"
+          git config user.name 'oss-agent-worker'
+          git config user.email 'oss-agent-worker@users.noreply.github.com'
+
           git remote remove upstream 2>/dev/null || true
-          git remote add upstream "https://github.com/${upstream}.git"
-          git fetch upstream "$base"
-          git switch -C "$branch" "upstream/$base"
-          n=$(jq '.files|length' /tmp/task.json)
-          for ((i=0;i<n;i++)); do p=$(jq -r ".files[$i].path" /tmp/task.json); mkdir -p "$(dirname "$p")"; jq -r ".files[$i].content" /tmp/task.json > "$p"; done
-          n=$(jq '.edits|length' /tmp/task.json)
-          for ((i=0;i<n;i++)); do jq -c ".edits[$i]" /tmp/task.json > /tmp/edit.json; p=$(jq -r '.path' /tmp/edit.json); python3 -c 'import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); e=json.load(open(sys.argv[2])); s=p.read_text(); c=s.count(e["old"]); assert c==1, f"exact edit match count != 1 ({c})"; p.write_text(s.replace(e["old"],e["new"],1))' "$p" /tmp/edit.json; done
+          git remote add upstream "https://github.com/${upstream_repo}.git"
+          git fetch upstream "$base_ref"
+
+          branch_strategy=$(jq -r '.branch_strategy // "fresh"' /tmp/task.json)
+          if [ "$branch_strategy" = 'existing' ] && git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch origin "$branch"
+            git switch -C "$branch" "origin/$branch"
+          else
+            git switch -C "$branch" "upstream/$base_ref"
+          fi
+
+          file_count=$(jq '.files // [] | length' /tmp/task.json)
+          for ((i=0; i<file_count; i++)); do
+            path=$(jq -r ".files[$i].path" /tmp/task.json)
+            if [[ "$path" = /* || "$path" == *..* ]]; then
+              echo "Unsafe path: $path" >&2
+              exit 13
+            fi
+            mkdir -p "$(dirname "$path")"
+            jq -r ".files[$i].content" /tmp/task.json > "$path"
+          done
+
+          edit_count=$(jq '.edits // [] | length' /tmp/task.json)
+          for ((i=0; i<edit_count; i++)); do
+            path=$(jq -r ".edits[$i].path" /tmp/task.json)
+            if [[ "$path" = /* || "$path" == *..* ]]; then
+              echo "Unsafe path: $path" >&2
+              exit 14
+            fi
+            jq -c ".edits[$i]" /tmp/task.json > /tmp/edit.json
+            python3 - "$path" /tmp/edit.json <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          edit = json.load(open(sys.argv[2], encoding='utf-8'))
+          text = path.read_text(encoding='utf-8')
+          old, new = edit['old'], edit['new']
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'exact edit match count != 1 ({count})')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+          done
+
           git diff --check
-          mode=$(jq -r '.test_mode' /tmp/task.json)
-          if [ "$mode" = go_test ]; then target=$(jq -r '.test_target // ""' /tmp/task.json); if [ -n "$target" ]; then go test "$target"; else go test ./...; fi; fi
-          git add -A
-          git commit -m "$(jq -r '.commit_message' /tmp/task.json)"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo 'Task produced no changes' >&2
+            exit 15
+          fi
+
+          test_mode=$(jq -r '.test_mode // "diff_check"' /tmp/task.json)
+          test_target=$(jq -r '.test_target // empty' /tmp/task.json)
+          case "$test_mode" in
+            diff_check) ;;
+            go_test)
+              if [ -n "$test_target" ]; then go test "$test_target"; else go test ./...; fi
+              ;;
+            bazel_build)
+              test -n "$test_target"
+              bazel build "$test_target"
+              ;;
+            *)
+              echo "Unsupported test_mode: $test_mode" >&2
+              exit 16
+              ;;
+          esac
+
+          commit_message=$(jq -r '.commit_message' /tmp/task.json)
+          git add --all
+          git commit -m "$commit_message"
           git push --force-with-lease origin "$branch"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          sha=$(git rev-parse HEAD)
+          compare_url="https://github.com/${upstream_repo}/compare/${base_ref}...${actor}:${branch}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "fork_repo=$fork_repo" >> "$GITHUB_OUTPUT"
+          echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"
+          echo "compare_url=$compare_url" >> "$GITHUB_OUTPUT"
+
       - name: Get fresh report OIDC token
         if: steps.task.outputs.has_task == 'true' && always()
         id: report_oidc
@@ -84,21 +243,53 @@ jobs:
           url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"
           token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url")
           echo "token=$(printf '%s' "$token_json" | jq -r '.value')" >> "$GITHUB_OUTPUT"
+
       - name: Report success
         if: steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'success'
         env:
           OIDC_TOKEN: ${{ steps.report_oidc.outputs.token }}
+          TASK_ID: ${{ steps.task.outputs.task_id }}
+          SHA: ${{ steps.exec.outputs.sha }}
+          BRANCH: ${{ steps.exec.outputs.branch }}
+          FORK_REPO: ${{ steps.exec.outputs.fork_repo }}
+          UPSTREAM_REPO: ${{ steps.exec.outputs.upstream_repo }}
+          COMPARE_URL: ${{ steps.exec.outputs.compare_url }}
+          PR_URL: ${{ steps.exec.outputs.pr_url }}
+          PR_NUMBER: ${{ steps.exec.outputs.pr_number }}
         shell: bash
         run: |
           set -euo pipefail
-          jq -n --argjson task_id '${{ steps.task.outputs.task_id }}' --arg sha '${{ steps.exec.outputs.sha }}' --arg branch '${{ steps.exec.outputs.branch }}' '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch}}' > /tmp/report.json
-          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker
+          jq -n \
+            --argjson task_id "$TASK_ID" \
+            --arg sha "$SHA" \
+            --arg branch "$BRANCH" \
+            --arg fork_repo "$FORK_REPO" \
+            --arg upstream_repo "$UPSTREAM_REPO" \
+            --arg compare_url "$COMPARE_URL" \
+            --arg pr_url "$PR_URL" \
+            --arg pr_number "$PR_NUMBER" \
+            '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch,fork_repo:$fork_repo,upstream_repo:$upstream_repo,compare_url:$compare_url,pr_url:$pr_url,pr_number:($pr_number|tonumber? // null)}}' \
+            > /tmp/report.json
+          curl -fsSL \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/report.json \
+            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
+
       - name: Report failure
         if: steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'failure'
         env:
           OIDC_TOKEN: ${{ steps.report_oidc.outputs.token }}
+          TASK_ID: ${{ steps.task.outputs.task_id }}
         shell: bash
         run: |
           set -euo pipefail
-          jq -n --argjson task_id '${{ steps.task.outputs.task_id }}' '{action:"report",status:"failed",task_id:$task_id,error:"GitHub Actions worker failed; inspect workflow logs."}' > /tmp/report.json
-          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker || true
+          jq -n \
+            --argjson task_id "$TASK_ID" \
+            '{action:"report",status:"failed",task_id:$task_id,error:"GitHub CLI worker failed; inspect workflow logs."}' \
+            > /tmp/report-failure.json
+          curl -fsSL \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/report-failure.json \
+            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' || true
