@@ -1,4 +1,4 @@
-# oss agent worker v10 - dispatched by Supabase, centralized GitHub credential
+# oss agent worker v11 - dispatched by Supabase, centralized GitHub credential
 name: OSS Agent Worker Active
 
 on:
@@ -114,6 +114,9 @@ jobs:
           case "$test_mode" in
             diff_check) ;;
             go_test) if [ -n "$test_target" ]; then go test "$test_target"; else go test ./...; fi ;;
+            rust_test)
+              if [ -n "$test_target" ]; then cargo test -p "$test_target"; else cargo test --workspace; fi
+              ;;
             bazel_build) test -n "$test_target"; bazel build "$test_target" ;;
             python_test)
               if [ -f pyproject.toml ] || [ -d tests ]; then python3 -m pytest -q; else python3 -m compileall -q .; fi ;;
