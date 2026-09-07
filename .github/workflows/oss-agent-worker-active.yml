@@ -1,4 +1,4 @@
-# oss agent worker v6 - centralized GitHub credential via Supabase
+# oss agent worker v7 - centralized GitHub credential via Supabase
 name: OSS Agent Worker Active
 
 on:
@@ -105,6 +105,7 @@ jobs:
           export GH_TOKEN="$OSS_AGENT_GITHUB_TOKEN"
 
           gh auth status >/dev/null
+          gh auth setup-git
           actor=$(gh api user --jq '.login')
           echo "GitHub CLI actor: $actor"
 
