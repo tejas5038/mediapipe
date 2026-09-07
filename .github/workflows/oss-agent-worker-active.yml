@@ -1,4 +1,4 @@
-# oss agent worker v5 - CLI fallback for arbitrary public repositories
+# oss agent worker v6 - centralized GitHub credential via Supabase
 name: OSS Agent Worker Active
 
 on:
@@ -58,12 +58,32 @@ jobs:
           echo "task_id=$id" >> "$GITHUB_OUTPUT"
           jq -c '.task' /tmp/response.json > /tmp/task.json
 
+      - name: Fetch centralized GitHub credential
+        if: steps.task.outputs.has_task == 'true'
+        id: credential
+        env:
+          OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          credential_json=$(curl -fsSL \
+            -H "Authorization: Bearer ${OIDC_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d '{"action":"github_credential"}' \
+            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker')
+          token=$(printf '%s' "$credential_json" | jq -r '.token // empty')
+          if [ -z "$token" ]; then
+            echo 'Supabase did not return a GitHub worker credential' >&2
+            exit 20
+          fi
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
       - name: Execute task with GitHub CLI fallback
         if: steps.task.outputs.has_task == 'true'
         id: exec
         env:
-          OSS_AGENT_GITHUB_TOKEN: ${{ secrets.OSS_AGENT_GITHUB_TOKEN }}
-          DEFAULT_GITHUB_TOKEN: ${{ github.token }}
+          OSS_AGENT_GITHUB_TOKEN: ${{ steps.credential.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -78,13 +98,11 @@ jobs:
             exit 10
           fi
 
-          # Prefer the long-lived user token. GH_TOKEN makes gh fully non-interactive:
-          # no browser login, gh auth refresh, or persisted runner session is required.
-          if [ -n "${OSS_AGENT_GITHUB_TOKEN:-}" ]; then
-            export GH_TOKEN="$OSS_AGENT_GITHUB_TOKEN"
-          else
-            export GH_TOKEN="$DEFAULT_GITHUB_TOKEN"
+          if [ -z "${OSS_AGENT_GITHUB_TOKEN:-}" ]; then
+            echo 'Centralized GitHub worker credential is missing' >&2
+            exit 21
           fi
+          export GH_TOKEN="$OSS_AGENT_GITHUB_TOKEN"
 
           gh auth status >/dev/null
           actor=$(gh api user --jq '.login')
@@ -121,8 +139,6 @@ jobs:
             gh repo clone "$upstream_repo" "$workdir" -- --filter=blob:none
             fork_repo="$upstream_repo"
           else
-            # This is the key fallback for repos that are discoverable publicly but are
-            # unavailable through the connector/plugin installation surface.
             if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then
               parent=$(gh api "repos/${fork_repo}" --jq '.parent.full_name // empty')
               if [ "$parent" != "$upstream_repo" ]; then
@@ -133,7 +149,6 @@ jobs:
               gh repo fork "$upstream_repo" --clone=false
             fi
 
-            # Fork creation can be asynchronous. Wait briefly until the fork is readable.
             ready=false
             for _ in $(seq 1 12); do
               if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then
@@ -277,7 +292,7 @@ jobs:
             'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
 
       - name: Report failure
-        if: steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'failure'
+        if: steps.task.outputs.has_task == 'true' && (steps.credential.outcome == 'failure' || steps.exec.outcome == 'failure')
         env:
           OIDC_TOKEN: ${{ steps.report_oidc.outputs.token }}
           TASK_ID: ${{ steps.task.outputs.task_id }}
@@ -286,7 +301,7 @@ jobs:
           set -euo pipefail
           jq -n \
             --argjson task_id "$TASK_ID" \
-            '{action:"report",status:"failed",task_id:$task_id,error:"GitHub CLI worker failed; inspect workflow logs."}' \
+            '{action:"report",status:"failed",task_id:$task_id,error:"GitHub worker failed; inspect workflow logs."}' \
             > /tmp/report-failure.json
           curl -fsSL \
             -H "Authorization: Bearer ${OIDC_TOKEN}" \
