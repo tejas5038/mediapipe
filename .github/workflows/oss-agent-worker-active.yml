@@ -1,4 +1,4 @@
-# oss agent worker v7 - centralized GitHub credential via Supabase
+# oss agent worker v8 - dispatched by Supabase, centralized GitHub credential
 name: OSS Agent Worker Active
 
 on:
@@ -8,8 +8,6 @@ on:
       - master
     paths:
       - '.github/workflows/oss-agent-worker-active.yml'
-  schedule:
-    - cron: '*/5 * * * *'
 
 permissions:
   contents: write
