@@ -1,4 +1,4 @@
-# oss agent worker v8 - dispatched by Supabase, centralized GitHub credential
+# oss agent worker v9 - dispatched by Supabase, centralized GitHub credential
 name: OSS Agent Worker Active
 
 on:
@@ -13,10 +13,6 @@ permissions:
   contents: write
   pull-requests: write
   id-token: write
-
-concurrency:
-  group: oss-agent-worker-active
-  cancel-in-progress: false
 
 jobs:
   worker:
