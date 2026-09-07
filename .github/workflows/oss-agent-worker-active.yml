@@ -1,4 +1,4 @@
-# oss agent worker v11 - dispatched by Supabase, centralized GitHub credential
+# oss agent worker v12 - dispatched by Supabase, centralized GitHub credential
 name: OSS Agent Worker Active
 
 on:
@@ -92,9 +92,23 @@ jobs:
             ready=false; for _ in $(seq 1 12); do if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then ready=true; break; fi; sleep 5; done; [ "$ready" = true ] || exit 12
             gh repo clone "$fork_repo" "$workdir" -- --filter=blob:none
           fi
-          cd "$workdir"; git config user.name 'oss-agent-worker'; git config user.email 'oss-agent-worker@users.noreply.github.com'; git remote remove upstream 2>/dev/null || true; git remote add upstream "https://github.com/${upstream_repo}.git"; git fetch upstream "$base_ref"
+          cd "$workdir"
+          git config user.name 'Tejas Pravinbhai Patel'
+          git config user.email '31176477+tejas5038@users.noreply.github.com'
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${upstream_repo}.git"
+          git fetch upstream "$base_ref"
           branch_strategy=$(jq -r '.branch_strategy // "fresh"' /tmp/task.json)
           if [ "$branch_strategy" = existing ] && git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then git fetch origin "$branch"; git switch -C "$branch" "origin/$branch"; else git switch -C "$branch" "upstream/$base_ref"; fi
+
+          repair_action=$(jq -r '.repair_action // empty' /tmp/task.json)
+          if [ "$repair_action" = 'reauthor_only' ]; then
+            git rebase --exec 'git commit --amend --no-edit --reset-author' "upstream/$base_ref"
+            git push --force-with-lease origin "$branch"
+            sha=$(git rev-parse HEAD); compare_url="https://github.com/${upstream_repo}/compare/${base_ref}...${actor}:${branch}"
+            echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "branch=$branch" >> "$GITHUB_OUTPUT"; echo "fork_repo=$fork_repo" >> "$GITHUB_OUTPUT"; echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"; echo "compare_url=$compare_url" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           file_count=$(jq '.files // [] | length' /tmp/task.json)
           for ((i=0;i<file_count;i++)); do path=$(jq -r ".files[$i].path" /tmp/task.json); [[ "$path" != /* && "$path" != *..* ]] || exit 13; mkdir -p "$(dirname "$path")"; jq -r ".files[$i].content" /tmp/task.json > "$path"; done
