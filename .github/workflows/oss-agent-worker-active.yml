@@ -1,4 +1,4 @@
-# oss agent worker v9 - dispatched by Supabase, centralized GitHub credential
+# oss agent worker v10 - dispatched by Supabase, centralized GitHub credential
 name: OSS Agent Worker Active
 
 on:
@@ -37,17 +37,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d '{"action":"next_task"}' \
-            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' \
-            > /tmp/response.json
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' -d '{"action":"next_task"}' 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' > /tmp/response.json
           id=$(jq -r '.task.id // empty' /tmp/response.json)
-          if [ -z "$id" ]; then
-            echo 'has_task=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          if [ -z "$id" ]; then echo 'has_task=false' >> "$GITHUB_OUTPUT"; exit 0; fi
           echo 'has_task=true' >> "$GITHUB_OUTPUT"
           echo "task_id=$id" >> "$GITHUB_OUTPUT"
           jq -c '.task' /tmp/response.json > /tmp/task.json
@@ -60,16 +52,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          credential_json=$(curl -fsSL \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d '{"action":"github_credential"}' \
-            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker')
+          credential_json=$(curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' -d '{"action":"github_credential"}' 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker')
           token=$(printf '%s' "$credential_json" | jq -r '.token // empty')
-          if [ -z "$token" ]; then
-            echo 'Supabase did not return a GitHub worker credential' >&2
-            exit 20
-          fi
+          test -n "$token" || { echo 'Supabase did not return a GitHub worker credential' >&2; exit 20; }
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
 
@@ -81,168 +66,73 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           task_type=$(jq -r '.task_type // "repo_edit"' /tmp/task.json)
           upstream_repo=$(jq -r '.upstream_repo' /tmp/task.json)
           base_ref=$(jq -r '.base_ref' /tmp/task.json)
           branch=$(jq -r '.branch_name' /tmp/task.json)
-
-          if [ -z "$upstream_repo" ] || [ "$upstream_repo" = "null" ]; then
-            echo 'Task is missing upstream_repo' >&2
-            exit 10
-          fi
-
-          if [ -z "${OSS_AGENT_GITHUB_TOKEN:-}" ]; then
-            echo 'Centralized GitHub worker credential is missing' >&2
-            exit 21
-          fi
+          test -n "$upstream_repo" && [ "$upstream_repo" != null ] || exit 10
+          test -n "${OSS_AGENT_GITHUB_TOKEN:-}" || exit 21
           export GH_TOKEN="$OSS_AGENT_GITHUB_TOKEN"
-
           gh auth status >/dev/null
           gh auth setup-git
           actor=$(gh api user --jq '.login')
-          echo "GitHub CLI actor: $actor"
 
           if [ "$task_type" = 'github_create_pr' ]; then
-            title=$(jq -r '.title' /tmp/task.json)
-            body=$(jq -r '.body' /tmp/task.json)
-            head=$(jq -r '.head // empty' /tmp/task.json)
-            if [ -z "$head" ]; then
-              head="${actor}:${branch}"
-            fi
-
-            pr_url=$(gh pr create \
-              --repo "$upstream_repo" \
-              --base "$base_ref" \
-              --head "$head" \
-              --title "$title" \
-              --body "$body")
+            title=$(jq -r '.title' /tmp/task.json); body=$(jq -r '.body' /tmp/task.json); head=$(jq -r '.head // empty' /tmp/task.json)
+            [ -n "$head" ] || head="${actor}:${branch}"
+            pr_url=$(gh pr create --repo "$upstream_repo" --base "$base_ref" --head "$head" --title "$title" --body "$body")
             pr_number=$(gh pr view "$pr_url" --json number --jq '.number')
-            echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
-            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
-            echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"
-            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+            echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"; echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"; echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"; echo "branch=$branch" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          repo_name=${upstream_repo#*/}
-          fork_repo="${actor}/${repo_name}"
-          workdir="${RUNNER_TEMP}/oss-target"
-          rm -rf "$workdir"
-
-          if [ "$upstream_repo" = "$GITHUB_REPOSITORY" ]; then
-            gh repo clone "$upstream_repo" "$workdir" -- --filter=blob:none
-            fork_repo="$upstream_repo"
-          else
-            if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then
-              parent=$(gh api "repos/${fork_repo}" --jq '.parent.full_name // empty')
-              if [ "$parent" != "$upstream_repo" ]; then
-                echo "Cannot fork $upstream_repo: $fork_repo already exists and is not its fork" >&2
-                exit 11
-              fi
-            else
-              gh repo fork "$upstream_repo" --clone=false
-            fi
-
-            ready=false
-            for _ in $(seq 1 12); do
-              if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then
-                ready=true
-                break
-              fi
-              sleep 5
-            done
-            if [ "$ready" != true ]; then
-              echo "Fork $fork_repo did not become ready" >&2
-              exit 12
-            fi
-
+          repo_name=${upstream_repo#*/}; fork_repo="${actor}/${repo_name}"; workdir="${RUNNER_TEMP}/oss-target"; rm -rf "$workdir"
+          if [ "$upstream_repo" = "$GITHUB_REPOSITORY" ]; then gh repo clone "$upstream_repo" "$workdir" -- --filter=blob:none; fork_repo="$upstream_repo"; else
+            if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then parent=$(gh api "repos/${fork_repo}" --jq '.parent.full_name // empty'); [ "$parent" = "$upstream_repo" ] || exit 11; else gh repo fork "$upstream_repo" --clone=false; fi
+            ready=false; for _ in $(seq 1 12); do if gh repo view "$fork_repo" --json nameWithOwner >/dev/null 2>&1; then ready=true; break; fi; sleep 5; done; [ "$ready" = true ] || exit 12
             gh repo clone "$fork_repo" "$workdir" -- --filter=blob:none
           fi
-
-          cd "$workdir"
-          git config user.name 'oss-agent-worker'
-          git config user.email 'oss-agent-worker@users.noreply.github.com'
-
-          git remote remove upstream 2>/dev/null || true
-          git remote add upstream "https://github.com/${upstream_repo}.git"
-          git fetch upstream "$base_ref"
-
+          cd "$workdir"; git config user.name 'oss-agent-worker'; git config user.email 'oss-agent-worker@users.noreply.github.com'; git remote remove upstream 2>/dev/null || true; git remote add upstream "https://github.com/${upstream_repo}.git"; git fetch upstream "$base_ref"
           branch_strategy=$(jq -r '.branch_strategy // "fresh"' /tmp/task.json)
-          if [ "$branch_strategy" = 'existing' ] && git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            git fetch origin "$branch"
-            git switch -C "$branch" "origin/$branch"
-          else
-            git switch -C "$branch" "upstream/$base_ref"
-          fi
+          if [ "$branch_strategy" = existing ] && git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then git fetch origin "$branch"; git switch -C "$branch" "origin/$branch"; else git switch -C "$branch" "upstream/$base_ref"; fi
 
           file_count=$(jq '.files // [] | length' /tmp/task.json)
-          for ((i=0; i<file_count; i++)); do
-            path=$(jq -r ".files[$i].path" /tmp/task.json)
-            if [[ "$path" = /* || "$path" == *..* ]]; then
-              echo "Unsafe path: $path" >&2
-              exit 13
-            fi
-            mkdir -p "$(dirname "$path")"
-            jq -r ".files[$i].content" /tmp/task.json > "$path"
-          done
-
+          for ((i=0;i<file_count;i++)); do path=$(jq -r ".files[$i].path" /tmp/task.json); [[ "$path" != /* && "$path" != *..* ]] || exit 13; mkdir -p "$(dirname "$path")"; jq -r ".files[$i].content" /tmp/task.json > "$path"; done
           edit_count=$(jq '.edits // [] | length' /tmp/task.json)
-          for ((i=0; i<edit_count; i++)); do
-            path=$(jq -r ".edits[$i].path" /tmp/task.json)
-            if [[ "$path" = /* || "$path" == *..* ]]; then
-              echo "Unsafe path: $path" >&2
-              exit 14
-            fi
-            jq -c ".edits[$i]" /tmp/task.json > /tmp/edit.json
+          for ((i=0;i<edit_count;i++)); do
+            path=$(jq -r ".edits[$i].path" /tmp/task.json); [[ "$path" != /* && "$path" != *..* ]] || exit 14; jq -c ".edits[$i]" /tmp/task.json >/tmp/edit.json
             python3 - "$path" /tmp/edit.json <<'PY'
-          import json, pathlib, sys
-          path = pathlib.Path(sys.argv[1])
-          edit = json.load(open(sys.argv[2], encoding='utf-8'))
-          text = path.read_text(encoding='utf-8')
-          old, new = edit['old'], edit['new']
-          count = text.count(old)
-          if count != 1:
-              raise SystemExit(f'exact edit match count != 1 ({count})')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          import json,pathlib,sys
+          path=pathlib.Path(sys.argv[1]); edit=json.load(open(sys.argv[2],encoding='utf-8')); text=path.read_text(encoding='utf-8'); old,new=edit['old'],edit['new']; count=text.count(old)
+          if count!=1: raise SystemExit(f'exact edit match count != 1 ({count})')
+          path.write_text(text.replace(old,new,1),encoding='utf-8')
           PY
           done
+          git diff --check; [ -n "$(git status --porcelain)" ] || exit 15
 
-          git diff --check
-          if [ -z "$(git status --porcelain)" ]; then
-            echo 'Task produced no changes' >&2
-            exit 15
-          fi
-
-          test_mode=$(jq -r '.test_mode // "diff_check"' /tmp/task.json)
-          test_target=$(jq -r '.test_target // empty' /tmp/task.json)
+          test_mode=$(jq -r '.test_mode // "diff_check"' /tmp/task.json); test_target=$(jq -r '.test_target // empty' /tmp/task.json)
           case "$test_mode" in
             diff_check) ;;
-            go_test)
-              if [ -n "$test_target" ]; then go test "$test_target"; else go test ./...; fi
+            go_test) if [ -n "$test_target" ]; then go test "$test_target"; else go test ./...; fi ;;
+            bazel_build) test -n "$test_target"; bazel build "$test_target" ;;
+            python_test)
+              if [ -f pyproject.toml ] || [ -d tests ]; then python3 -m pytest -q; else python3 -m compileall -q .; fi ;;
+            node_test)
+              if [ -f package-lock.json ]; then npm ci --ignore-scripts; elif [ -f npm-shrinkwrap.json ]; then npm ci --ignore-scripts; elif [ -f package.json ]; then npm install --ignore-scripts --package-lock=false; else exit 16; fi
+              node -e "let p=require('./package.json'); process.exit(p.scripts&&p.scripts.test?0:1)" && npm test -- --runInBand || { node -e "let p=require('./package.json'); process.exit(p.scripts&&p.scripts.test?1:0)" || exit $?; }
               ;;
-            bazel_build)
-              test -n "$test_target"
-              bazel build "$test_target"
-              ;;
-            *)
-              echo "Unsupported test_mode: $test_mode" >&2
-              exit 16
-              ;;
+            jvm_test)
+              if [ -x ./gradlew ]; then ./gradlew test --no-daemon; elif [ -f pom.xml ]; then mvn -B test; else exit 16; fi ;;
+            dotnet_test)
+              if find . -maxdepth 3 \( -name '*.sln' -o -name '*.csproj' \) -print -quit | grep -q .; then dotnet test --nologo; else exit 16; fi ;;
+            cmake_test)
+              if [ -f CMakeLists.txt ]; then cmake -S . -B build -DCMAKE_BUILD_TYPE=Release; cmake --build build --parallel 2; ctest --test-dir build --output-on-failure; else exit 16; fi ;;
+            *) echo "Unsupported test_mode: $test_mode" >&2; exit 16 ;;
           esac
 
-          commit_message=$(jq -r '.commit_message' /tmp/task.json)
-          git add --all
-          git commit -m "$commit_message"
-          git push --force-with-lease origin "$branch"
-
-          sha=$(git rev-parse HEAD)
-          compare_url="https://github.com/${upstream_repo}/compare/${base_ref}...${actor}:${branch}"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "fork_repo=$fork_repo" >> "$GITHUB_OUTPUT"
-          echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"
-          echo "compare_url=$compare_url" >> "$GITHUB_OUTPUT"
+          commit_message=$(jq -r '.commit_message' /tmp/task.json); git add --all; git commit -m "$commit_message"; git push --force-with-lease origin "$branch"
+          sha=$(git rev-parse HEAD); compare_url="https://github.com/${upstream_repo}/compare/${base_ref}...${actor}:${branch}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "branch=$branch" >> "$GITHUB_OUTPUT"; echo "fork_repo=$fork_repo" >> "$GITHUB_OUTPUT"; echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"; echo "compare_url=$compare_url" >> "$GITHUB_OUTPUT"
 
       - name: Get fresh report OIDC token
         if: steps.task.outputs.has_task == 'true' && always()
@@ -250,9 +140,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"
-          token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url")
-          echo "token=$(printf '%s' "$token_json" | jq -r '.value')" >> "$GITHUB_OUTPUT"
+          url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"; token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url"); echo "token=$(printf '%s' "$token_json" | jq -r '.value')" >> "$GITHUB_OUTPUT"
 
       - name: Report success
         if: steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'success'
@@ -269,22 +157,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          jq -n \
-            --argjson task_id "$TASK_ID" \
-            --arg sha "$SHA" \
-            --arg branch "$BRANCH" \
-            --arg fork_repo "$FORK_REPO" \
-            --arg upstream_repo "$UPSTREAM_REPO" \
-            --arg compare_url "$COMPARE_URL" \
-            --arg pr_url "$PR_URL" \
-            --arg pr_number "$PR_NUMBER" \
-            '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch,fork_repo:$fork_repo,upstream_repo:$upstream_repo,compare_url:$compare_url,pr_url:$pr_url,pr_number:($pr_number|tonumber? // null)}}' \
-            > /tmp/report.json
-          curl -fsSL \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            --data-binary @/tmp/report.json \
-            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
+          jq -n --argjson task_id "$TASK_ID" --arg sha "$SHA" --arg branch "$BRANCH" --arg fork_repo "$FORK_REPO" --arg upstream_repo "$UPSTREAM_REPO" --arg compare_url "$COMPARE_URL" --arg pr_url "$PR_URL" --arg pr_number "$PR_NUMBER" '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch,fork_repo:$fork_repo,upstream_repo:$upstream_repo,compare_url:$compare_url,pr_url:$pr_url,pr_number:($pr_number|tonumber? // null)}}' >/tmp/report.json
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
 
       - name: Report failure
         if: steps.task.outputs.has_task == 'true' && (steps.credential.outcome == 'failure' || steps.exec.outcome == 'failure')
@@ -294,12 +168,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          jq -n \
-            --argjson task_id "$TASK_ID" \
-            '{action:"report",status:"failed",task_id:$task_id,error:"GitHub worker failed; inspect workflow logs."}' \
-            > /tmp/report-failure.json
-          curl -fsSL \
-            -H "Authorization: Bearer ${OIDC_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            --data-binary @/tmp/report-failure.json \
-            'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' || true
+          jq -n --argjson task_id "$TASK_ID" '{action:"report",status:"failed",task_id:$task_id,error:"GitHub worker failed; inspect workflow logs."}' >/tmp/report-failure.json
+          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report-failure.json 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' || true
