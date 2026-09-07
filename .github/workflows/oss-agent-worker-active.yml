@@ -1,4 +1,4 @@
-# oss agent worker v12 - dispatched by Supabase, centralized GitHub credential
+# oss agent worker v13 - dispatched by Supabase, centralized GitHub credential
 name: OSS Agent Worker Active
 
 on:
@@ -129,7 +129,15 @@ jobs:
             diff_check) ;;
             go_test) if [ -n "$test_target" ]; then go test "$test_target"; else go test ./...; fi ;;
             rust_test)
-              if [ -n "$test_target" ]; then cargo test -p "$test_target"; else cargo test --workspace; fi
+              if [ -f Cargo.toml ]; then
+                cargo_manifest='Cargo.toml'
+              elif [ -f engine/Cargo.toml ]; then
+                cargo_manifest='engine/Cargo.toml'
+              else
+                cargo_manifest=$(find . -mindepth 2 -maxdepth 3 -name Cargo.toml -print -quit)
+              fi
+              test -n "${cargo_manifest:-}" || { echo 'No Cargo.toml found within supported workspace depth' >&2; exit 16; }
+              if [ -n "$test_target" ]; then cargo test --manifest-path "$cargo_manifest" -p "$test_target"; else cargo test --manifest-path "$cargo_manifest" --workspace; fi
               ;;
             bazel_build) test -n "$test_target"; bazel build "$test_target" ;;
             python_test)
@@ -152,7 +160,7 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"; echo "branch=$branch" >> "$GITHUB_OUTPUT"; echo "fork_repo=$fork_repo" >> "$GITHUB_OUTPUT"; echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"; echo "compare_url=$compare_url" >> "$GITHUB_OUTPUT"
 
       - name: Get fresh report OIDC token
-        if: steps.task.outputs.has_task == 'true' && always()
+        if: always() && steps.task.outputs.has_task == 'true'
         id: report_oidc
         shell: bash
         run: |
@@ -160,7 +168,7 @@ jobs:
           url="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=oss-agent-supabase"; token_json=$(curl -fsSL -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "$url"); echo "token=$(printf '%s' "$token_json" | jq -r '.value')" >> "$GITHUB_OUTPUT"
 
       - name: Report success
-        if: steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'success'
+        if: always() && steps.task.outputs.has_task == 'true' && steps.exec.outcome == 'success'
         env:
           OIDC_TOKEN: ${{ steps.report_oidc.outputs.token }}
           TASK_ID: ${{ steps.task.outputs.task_id }}
@@ -178,7 +186,7 @@ jobs:
           curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
 
       - name: Report failure
-        if: steps.task.outputs.has_task == 'true' && (steps.credential.outcome == 'failure' || steps.exec.outcome == 'failure')
+        if: always() && steps.task.outputs.has_task == 'true' && (steps.credential.outcome == 'failure' || steps.exec.outcome == 'failure')
         env:
           OIDC_TOKEN: ${{ steps.report_oidc.outputs.token }}
           TASK_ID: ${{ steps.task.outputs.task_id }}
