@@ -1,4 +1,4 @@
-# oss agent worker v13 - dispatched by Supabase, centralized GitHub credential
+# oss agent worker v14 - dispatched by Supabase, centralized GitHub credential
 name: OSS Agent Worker Active
 
 on:
@@ -147,6 +147,25 @@ jobs:
               node -e "let p=require('./package.json'); process.exit(p.scripts&&p.scripts.test?0:1)" && npm test -- --runInBand || { node -e "let p=require('./package.json'); process.exit(p.scripts&&p.scripts.test?1:0)" || exit $?; }
               ;;
             jvm_test)
+              required_java=$(python3 - <<'PY'
+          import pathlib,re
+          vals=[]
+          for p in [pathlib.Path('pom.xml'), *pathlib.Path('.').glob('**/pom.xml')]:
+              if not p.is_file(): continue
+              t=p.read_text(errors='ignore')[:200000]
+              for pat in [r'<maven\.compiler\.release>\s*(\d+)',r'<maven\.compiler\.source>\s*(\d+)',r'<release>\s*(\d+)']:
+                  vals += [int(x) for x in re.findall(pat,t)]
+          print(max(vals) if vals else 21)
+          PY
+              )
+              current_java=$(javac -version 2>&1 | sed -E 's/.* ([0-9]+).*/\1/' || echo 0)
+              if [ "$required_java" -gt "$current_java" ]; then
+                sudo apt-get update -qq
+                sudo apt-get install -y -qq "openjdk-${required_java}-jdk" || { sudo apt-get install -y -qq openjdk-21-jdk; required_java=21; }
+                export JAVA_HOME="/usr/lib/jvm/java-${required_java}-openjdk-amd64"
+                export PATH="$JAVA_HOME/bin:$PATH"
+              fi
+              java -version
               if [ -x ./gradlew ]; then ./gradlew test --no-daemon; elif [ -f pom.xml ]; then mvn -B test; else exit 16; fi ;;
             dotnet_test)
               if find . -maxdepth 3 \( -name '*.sln' -o -name '*.csproj' \) -print -quit | grep -q .; then dotnet test --nologo; else exit 16; fi ;;
