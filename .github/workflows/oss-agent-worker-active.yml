@@ -77,6 +77,17 @@ jobs:
           gh auth setup-git
           actor=$(gh api user --jq '.login')
 
+          if [ "$task_type" = 'github_issue_comment' ]; then
+            issue_number=$(jq -r '.issue_number' /tmp/task.json)
+            comment_body=$(jq -r '.comment_body' /tmp/task.json)
+            test -n "$issue_number" && [ "$issue_number" != null ] || exit 17
+            test -n "$comment_body" && [ "$comment_body" != null ] || exit 18
+            comment_url=$(gh issue comment "$issue_number" --repo "$upstream_repo" --body "$comment_body")
+            echo "comment_url=$comment_url" >> "$GITHUB_OUTPUT"
+            echo "upstream_repo=$upstream_repo" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ "$task_type" = 'github_create_pr' ]; then
             title=$(jq -r '.title' /tmp/task.json); body=$(jq -r '.body' /tmp/task.json); head=$(jq -r '.head // empty' /tmp/task.json)
             [ -n "$head" ] || head="${actor}:${branch}"
@@ -198,10 +209,11 @@ jobs:
           COMPARE_URL: ${{ steps.exec.outputs.compare_url }}
           PR_URL: ${{ steps.exec.outputs.pr_url }}
           PR_NUMBER: ${{ steps.exec.outputs.pr_number }}
+          COMMENT_URL: ${{ steps.exec.outputs.comment_url }}
         shell: bash
         run: |
           set -euo pipefail
-          jq -n --argjson task_id "$TASK_ID" --arg sha "$SHA" --arg branch "$BRANCH" --arg fork_repo "$FORK_REPO" --arg upstream_repo "$UPSTREAM_REPO" --arg compare_url "$COMPARE_URL" --arg pr_url "$PR_URL" --arg pr_number "$PR_NUMBER" '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch,fork_repo:$fork_repo,upstream_repo:$upstream_repo,compare_url:$compare_url,pr_url:$pr_url,pr_number:($pr_number|tonumber? // null)}}' >/tmp/report.json
+          jq -n --argjson task_id "$TASK_ID" --arg sha "$SHA" --arg branch "$BRANCH" --arg fork_repo "$FORK_REPO" --arg upstream_repo "$UPSTREAM_REPO" --arg compare_url "$COMPARE_URL" --arg pr_url "$PR_URL" --arg pr_number "$PR_NUMBER" --arg comment_url "$COMMENT_URL" '{action:"report",status:"completed",task_id:$task_id,result:{sha:$sha,branch:$branch,fork_repo:$fork_repo,upstream_repo:$upstream_repo,compare_url:$compare_url,pr_url:$pr_url,pr_number:($pr_number|tonumber? // null),comment_url:$comment_url}}' >/tmp/report.json
           curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' --data-binary @/tmp/report.json 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker'
 
       - name: Report failure
