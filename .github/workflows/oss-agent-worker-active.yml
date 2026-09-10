@@ -37,7 +37,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' -d '{"action":"next_task"}' 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' > /tmp/response.json
+          for attempt in 1 2 3; do
+            if curl -fsSL -H "Authorization: Bearer ${OIDC_TOKEN}" -H 'Content-Type: application/json' -d '{"action":"next_task"}' 'https://qhuyoffntxpylelzgbsx.supabase.co/functions/v1/oss-agent-github-worker' > /tmp/response.json; then
+              break
+            fi
+            [ "$attempt" -lt 3 ] || exit 22
+            sleep 3
+          done
           id=$(jq -r '.task.id // empty' /tmp/response.json)
           if [ -z "$id" ]; then echo 'has_task=false' >> "$GITHUB_OUTPUT"; exit 0; fi
           echo 'has_task=true' >> "$GITHUB_OUTPUT"
