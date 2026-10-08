@@ -172,14 +172,27 @@ jobs:
               t=p.read_text(errors='ignore')[:200000]
               for pat in [r'<maven\.compiler\.release>\s*(\d+)',r'<maven\.compiler\.source>\s*(\d+)',r'<release>\s*(\d+)']:
                   vals += [int(x) for x in re.findall(pat,t)]
-          print(max(vals) if vals else 21)
+          wrapper=pathlib.Path('gradle/wrapper/gradle-wrapper.properties')
+          if wrapper.is_file():
+              match=re.search(r'gradle-(\d+)\.(\d+)', wrapper.read_text(errors='ignore'))
+              if match and tuple(map(int, match.groups())) < (8, 5):
+                  print(17)
+              else:
+                  print(max(vals) if vals else 21)
+          else:
+              print(max(vals) if vals else 21)
           PY
               )
               current_java=$(javac -version 2>&1 | sed -E 's/.* ([0-9]+).*/\1/' || echo 0)
-              if [ "$required_java" -gt "$current_java" ]; then
-                sudo apt-get update -qq
-                sudo apt-get install -y -qq "openjdk-${required_java}-jdk" || { sudo apt-get install -y -qq openjdk-21-jdk; required_java=21; }
-                export JAVA_HOME="/usr/lib/jvm/java-${required_java}-openjdk-amd64"
+              if [ "$required_java" -ne "$current_java" ]; then
+                java_home_var="JAVA_HOME_${required_java}_X64"
+                if [ -n "${!java_home_var:-}" ]; then
+                  export JAVA_HOME="${!java_home_var}"
+                else
+                  sudo apt-get update -qq
+                  sudo apt-get install -y -qq "openjdk-${required_java}-jdk"
+                  export JAVA_HOME="/usr/lib/jvm/java-${required_java}-openjdk-amd64"
+                fi
                 export PATH="$JAVA_HOME/bin:$PATH"
               fi
               java -version
